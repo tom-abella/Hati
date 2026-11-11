@@ -1,23 +1,30 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { liveQuery } from 'dexie';
 import { possibleDuplicate, validateDocument } from '@/lib/documents';
 import { transactionPayload } from '@/lib/sync';
+import { receiptSuggestions } from '@/lib/receipt-text';
 
-export default function ImageEntry({ db, onSignIn }) {
+export default function ImageEntry({ db, cards, onSignIn }) {
   const [drafts, setDrafts] = useState([]);
   const [documents, setDocuments] = useState([]);
   const [selected, setSelected] = useState('');
   const [imageUrl, setImageUrl] = useState('');
   const [message, setMessage] = useState('');
-  const draft = drafts.find(item => item.id === selected);
+  const [temporaryDraft, setTemporaryDraft] = useState(null);
+  const [suggestions, setSuggestions] = useState({});
+  const [busy, setBusy] = useState(false);
+  const ocrController = useRef(null);
+  const draft = temporaryDraft || drafts.find(item => item.id === selected);
 
   useEffect(() => {
     if (!db) return;
+    const controller = new AbortController();
+    ocrController.current = controller;
     const draftsSubscription = liveQuery(() => db.imageDrafts.toArray()).subscribe({ next: setDrafts, error: () => setMessage('Could not read image drafts.') });
     const documentsSubscription = liveQuery(() => db.documents.toArray()).subscribe({ next: setDocuments, error: () => setMessage('Could not read confirmed records.') });
-    return () => { draftsSubscription.unsubscribe(); documentsSubscription.unsubscribe(); };
+    return () => { controller.abort(); draftsSubscription.unsubscribe(); documentsSubscription.unsubscribe(); };
   }, [db]);
 
   useEffect(() => {
@@ -34,54 +41,65 @@ export default function ImageEntry({ db, onSignIn }) {
     if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) {
       setMessage('Choose a JPEG, PNG or WebP image no larger than 10 MB.'); return;
     }
+    const id = crypto.randomUUID();
+    const signal = ocrController.current.signal;
+    setSelected(''); setTemporaryDraft({ id, image: file, name: file.name }); setSuggestions({}); setBusy(true);
+    setMessage('Reading image on this device…');
+    let worker;
     try {
-      const id = crypto.randomUUID();
-      await db.imageDrafts.add({ id, image: file, name: file.name, createdAt: Date.now() });
-      setSelected(id); setMessage('Image saved as a local draft. Enter and review the details below.');
-    } catch { setMessage('Could not save the image. Check available device storage.'); }
+      const { createWorker } = await import('tesseract.js');
+      worker = await createWorker('eng');
+      if (signal.aborted) return;
+      const result = await worker.recognize(file);
+      if (!signal.aborted) { setSuggestions(receiptSuggestions(result.data.text)); setMessage('Review every suggested field against the image before saving.'); }
+    } catch { if (!signal.aborted) setMessage('Could not read the image. You can enter the details manually.'); }
+    finally { if (worker) await worker.terminate(); if (!signal.aborted) setBusy(false); }
   }
 
   async function save(event) {
     event.preventDefault();
     const form = event.currentTarget;
     try {
-      const item = validateDocument(Object.fromEntries(new FormData(form)));
+      const data = new FormData(form);
+      const item = validateDocument(Object.fromEntries(data));
+      const cardId = String(data.get('card_id') || '');
+      if (cardId && (item.type !== 'expense' || !cards.some(card => card.id === cardId))) throw new Error('Select a credit card only for an expense.');
       const records = item.type === 'expense' ? await db.transactions.toArray() : await db.documents.toArray();
       if (possibleDuplicate(item, records) && !window.confirm('A record with the same type, date and amount exists. Save this possible duplicate?')) return;
       await db.transaction('rw', db.imageDrafts, db.documents, db.transactions, db.syncQueue, async () => {
-        const source = await db.imageDrafts.get(draft.id);
-        if (!source) throw new Error('This draft no longer exists.');
-        await db.documents.add({ ...item, id: draft.id, image: source.image, name: source.name });
+        if (!temporaryDraft && !await db.imageDrafts.get(draft.id)) throw new Error('This draft no longer exists.');
+        await db.documents.add({ ...item, id: draft.id, name: draft.name });
         if (item.type === 'expense') {
-          const record = { id: draft.id, type: 'expense', amount: item.amount, date: item.date, category: 'Uncategorized', account: '', note: item.merchant };
+          const record = { id: draft.id, type: 'expense', amount: item.amount, date: item.date, category: 'Uncategorized', account: '', note: item.merchant, card_id: cardId };
           await db.transactions.add(record);
           await db.syncQueue.add({ recordId: record.id, kind: 'create', record: transactionPayload(record) });
         }
         await db.imageDrafts.delete(draft.id);
       });
-      setSelected(''); setMessage('Saved on this device. Expenses are queued for sync; images, bills and statements are local only.');
+      setSelected(''); setTemporaryDraft(null); setSuggestions({}); setMessage('Details saved. The image was not saved. Expenses are queued for sync; bills and statements are local only.');
     } catch (error) { setMessage(error.issues?.[0]?.message || error.message || 'Could not save the record.'); }
   }
 
   async function discard() {
     if (!window.confirm('Delete this local image draft?')) return;
-    try { await db.imageDrafts.delete(draft.id); setSelected(''); setMessage('Draft deleted.'); }
+    try { if (!temporaryDraft) await db.imageDrafts.delete(draft.id); setTemporaryDraft(null); setSelected(''); setSuggestions({}); setMessage('Draft deleted.'); }
     catch { setMessage('Could not delete this draft.'); }
   }
 
   return <section className="image-entry"><h2>Receipt or bill</h2>
-    <p>Upload a photo or use your camera. Images and confirmed records are stored only on this device. Do not upload images showing full card numbers, CVVs or credentials. Automatic extraction is not available yet; enter and verify each field yourself.</p>
+    <p>Choose a photo to read it on this device. New images are not saved. Review all suggested details before saving.</p>
     {!db ? <button className="secondary image-action" onClick={onSignIn}>Sign in to save an image</button> : <>
-      <label className="image-picker">Choose an image or take a photo<input type="file" accept="image/jpeg,image/png,image/webp" onChange={upload} /></label>
-      {drafts.length > 0 && <label>Saved drafts<select value={selected} onChange={event => { setSelected(event.target.value); setMessage(''); }}><option value="">Choose a draft</option>{drafts.map(item => <option value={item.id} key={item.id}>{item.name || 'Image'} · {new Date(item.createdAt).toLocaleString()}</option>)}</select></label>}
-      {draft && <div key={draft.id}><img className="receipt-preview" src={imageUrl} alt="Selected receipt or bill" /><p>Review required: all fields are unverified. Bill and statement records are references only; they do not create a payable or reminder.</p>
-        <form onSubmit={save}>
+      <label className="image-picker">Choose an image or take a photo<input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={upload} /></label>
+      {drafts.length > 0 && <label>Previously saved drafts<select value={selected} disabled={busy} onChange={event => { setTemporaryDraft(null); setSuggestions({}); setSelected(event.target.value); setMessage(''); }}><option value="">Choose a draft</option>{drafts.map(item => <option value={item.id} key={item.id}>{item.name || 'Image'} · {new Date(item.createdAt).toLocaleString()}</option>)}</select></label>}
+      {draft && <div key={draft.id}>{imageUrl && <img className="receipt-preview" src={imageUrl} alt="Selected receipt or bill" />}<p>Review required: all fields are unverified. Bill and statement records are references only; they do not create a payable or reminder.</p>
+        {!busy && <form key={`${draft.id}-${suggestions.merchant || ''}-${suggestions.amount || ''}`} onSubmit={save}>
           <label>Record type<select name="type" defaultValue="expense"><option value="expense">Expense</option><option value="bill">Bill</option><option value="statement">Credit Card Statement</option></select></label>
-          <label>Merchant or provider — required<input name="merchant" maxLength="80" required /></label>
-          <div className="row"><label>Transaction date — required<input type="date" name="date" required /></label><label>Due date — required for bills and statements<input type="date" name="dueDate" /></label></div>
-          <div className="row"><label>Total — required<input name="amount" inputMode="decimal" required placeholder="0.00" /></label><label>Currency — required<select name="currency" defaultValue=""><option value="" disabled>Choose currency</option><option value="PHP">PHP</option></select></label></div>
+          <label>Credit card for expense <span className="optional">(optional)</span><select name="card_id"><option value="">No credit card</option>{cards.map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label>
+          <label>Merchant or provider — required<input name="merchant" maxLength="80" defaultValue={suggestions.merchant || ''} required /></label>
+          <div className="row"><label>Transaction date — required<input type="date" name="date" defaultValue={suggestions.date || ''} required /></label><label>Due date — required for bills and statements<input type="date" name="dueDate" /></label></div>
+          <div className="row"><label>Total — required<input name="amount" inputMode="decimal" defaultValue={suggestions.amount || ''} required placeholder="0.00" /></label><label>Currency — required<select name="currency" defaultValue=""><option value="" disabled>Choose currency</option><option value="PHP">PHP</option></select></label></div>
           <button type="submit">Confirm and save</button><button type="button" className="secondary" onClick={discard}>Delete draft</button>
-        </form>
+        </form>}
       </div>}
       {documents.length > 0 && <><h2>Confirmed records</h2><ul>{documents.map(item => <li key={item.id}><div><strong>{item.merchant}</strong><small>{item.type} · {item.date}{item.dueDate ? ` · due ${item.dueDate}` : ''} · PHP {(item.amount / 100).toFixed(2)}</small></div></li>)}</ul></>}
     </>}{message && <p role="status" className="image-message">{message}</p>}
