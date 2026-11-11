@@ -9,6 +9,9 @@ test('card spending, payments, undo and deleted expenses affect available credit
   assert.equal(availableCredit(card, expenses, [payment]), 75000);
   payment.paid = true;
   assert.equal(availableCredit(card, expenses, [payment]), 85000);
+  payment.deleted = true;
+  assert.equal(availableCredit(card, expenses, [payment]), 75000);
+  payment.deleted = false;
   payment.paid = false;
   assert.equal(availableCredit(card, expenses, [payment]), 75000);
   assert.equal(availableCredit(card, [], [payment]), 100000);

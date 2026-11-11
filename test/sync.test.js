@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import Dexie from 'dexie';
 import { accountDb } from '../lib/db.js';
-import { addCard, addReminder, addTransaction, deleteTransaction, documentPayload, setReminderPaid, syncTransactions, updateCard } from '../lib/sync.js';
+import { addCard, addReminder, addTransaction, deleteTransaction, documentPayload, setReminderPaid, syncTransactions, updateCard, updateReminder } from '../lib/sync.js';
 
 const entry = { id: 'a', type: 'expense', amount: 123, category: 'Food', date: '2026-11-10', account: '', note: '' };
 
@@ -164,6 +164,7 @@ test('payment and undo queue ordered versions and repeated actions are idempoten
 test('reminders and document details sync across devices and retain conflicting local changes', async () => {
   const first = accountDb(crypto.randomUUID());
   const second = accountDb(crypto.randomUUID());
+  const third = accountDb(crypto.randomUUID());
   const remote = { documents: [], payment_reminders: [], cards: [], transactions: [] };
   const client = {
     auth: { getSession: async () => ({ data: { session: { user: { id: 'user' } } } }) },
@@ -184,7 +185,7 @@ test('reminders and document details sync across devices and retain conflicting 
       const current = remote.payment_reminders.find(item => item.id === p.p_id);
       const conflict = current && current.version !== p.p_version && current.version !== p.p_previous_version;
       if (!conflict && (!current || current.version !== p.p_version)) {
-        const next = { id: p.p_id, title: p.p_title, due_date: p.p_due_date, paid: p.p_paid, card_id: p.p_card_id, amount: p.p_amount, send_at: p.p_send_at, version: p.p_version };
+        const next = { id: p.p_id, title: p.p_title, due_date: p.p_due_date, paid: p.p_paid, card_id: p.p_card_id, amount: p.p_amount, send_at: p.p_send_at, version: p.p_version, deleted_at: p.p_deleted ? '2026-11-11T00:00:00Z' : null };
         if (current) Object.assign(current, next); else remote.payment_reminders.push(next);
       }
       return { abortSignal: async () => ({ error: conflict ? new Error('Reminder conflict') : null }) };
@@ -200,11 +201,22 @@ test('reminders and document details sync across devices and retain conflicting 
     await syncTransactions(second, 'user', signal, client);
     assert.deepEqual(await second.documents.get('document'), document);
     assert.equal((await second.reminders.get('reminder')).paid, false);
+    const originalVersion = (await first.reminders.get('reminder')).syncVersion;
+    await updateReminder(first, 'reminder', { title: 'Updated card', amount: 200 }, originalVersion);
+    await syncTransactions(first, 'user', signal, client);
+    await syncTransactions(second, 'user', signal, client);
+    assert.equal((await second.reminders.get('reminder')).title, 'Updated card');
+    await assert.rejects(updateReminder(first, 'reminder', { title: 'Old edit' }, originalVersion), /changed/);
     await setReminderPaid(first, 'reminder', true);
     await syncTransactions(first, 'user', signal, client);
     await setReminderPaid(second, 'reminder', true);
     await assert.rejects(syncTransactions(second, 'user', signal, client), /conflict/);
     assert.equal((await second.reminders.get('reminder')).paid, true);
     assert.equal(await second.syncQueue.count(), 1);
-  } finally { await first.delete(); await second.delete(); }
+    await updateReminder(first, 'reminder', { deleted: true });
+    await syncTransactions(first, 'user', signal, client);
+    await syncTransactions(third, 'user', signal, client);
+    assert.equal((await third.reminders.get('reminder')).deleted, true);
+    await assert.rejects(updateReminder(first, 'reminder', { title: 'Again' }), /no longer exists/);
+  } finally { await first.delete(); await second.delete(); await third.delete(); }
 });

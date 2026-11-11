@@ -9,7 +9,7 @@ import { availableCredit } from '@/lib/cards';
 import { supabase } from '@/lib/supabase';
 import ImageEntry from './image-entry';
 import EnableNotificationsButton from './enable-notifications-button';
-import { addCard, addReminder, addTransaction, deleteTransaction, setReminderPaid, syncTransactions, updateCard } from '@/lib/sync';
+import { addCard, addReminder, addTransaction, deleteTransaction, setReminderPaid, syncTransactions, updateCard, updateReminder } from '@/lib/sync';
 
 const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 
@@ -196,6 +196,10 @@ function Budget({ user, onSignIn }) {
   </main>;
 }
 
+function ActionsMenu({ label, children }) {
+  return <details className="actions-menu" onClick={event => { if (event.target.closest('button')) event.currentTarget.open = false; }}><summary aria-label={label} title={label}>⋯</summary><div className="actions-menu-items">{children}</div></details>;
+}
+
 function Cards({ db, cards, entries, reminders, onSignIn }) {
   const [error, setError] = useState('');
   const [editing, setEditing] = useState(null);
@@ -229,19 +233,20 @@ function Cards({ db, cards, entries, reminders, onSignIn }) {
     <form onSubmit={add}><div className="row"><label>Card name<input name="name" maxLength="80" required placeholder="e.g. Visa" /></label><label>Credit limit (PHP)<input name="limit" inputMode="decimal" required placeholder="0.00" /></label></div><button type={db ? 'submit' : 'button'} onClick={db ? undefined : onSignIn}>{db ? 'Add card' : 'Sign in to add a card'}</button></form>
     {error && <p role="alert" className="error">{error}</p>}
     {editing && <form key={editing.id} onSubmit={saveEdit}><h2>Edit card</h2><div className="row"><label>Card name<input name="name" maxLength="80" required defaultValue={editing.name} /></label><label>Credit limit (PHP)<input name="limit" inputMode="decimal" required defaultValue={(editing.limit / 100).toFixed(2)} /></label></div><div className="auth-actions"><button type="submit">Save changes</button><button type="button" className="secondary" onClick={() => setEditing(null)}>Cancel</button></div></form>}
-    {cards.some(card => !card.deletedAt) && <ul>{cards.filter(card => !card.deletedAt).map(card => <li key={card.id}><div><strong>{card.name}</strong><small>Credit limit {money(card.limit)}</small></div><div className="card-row-end"><div className="entry-end"><strong>{money(availableCredit(card, entries, reminders))}</strong><small>Available credit</small></div><div className="card-actions"><button type="button" className="secondary" aria-label={`Edit ${card.name}`} title="Edit card" onClick={() => { setEditing(card); setError(''); }}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" /></svg></button><button type="button" className="delete" aria-label={`Remove ${card.name}`} title="Remove card" onClick={() => removeCard(card)}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m5 4v6m4-6v6" /></svg></button></div></div></li>)}</ul>}
+    {cards.some(card => !card.deletedAt) && <ul>{cards.filter(card => !card.deletedAt).map(card => <li key={card.id}><div><strong>{card.name}</strong><small>Credit limit {money(card.limit)}</small></div><div className="card-row-end"><div className="entry-end"><strong>{money(availableCredit(card, entries, reminders))}</strong><small>Available credit</small></div><ActionsMenu label={`Actions for ${card.name}`}><button type="button" onClick={() => { setEditing(card); setError(''); }}>Edit</button><button type="button" onClick={() => removeCard(card)}>Remove</button></ActionsMenu></div></li>)}</ul>}
   </section>;
 }
 
 function Reminders({ db, user, cards, onSignIn, onDueCount }) {
   const [reminders, setReminders] = useState([]);
+  const [editing, setEditing] = useState(null);
   const [error, setError] = useState('');
   const [date, setDate] = useState('');
   useEffect(() => {
     const update = () => setDate(today());
     update();
     window.addEventListener('focus', update);
-    const subscription = db && liveQuery(() => db.reminders.orderBy('dueDate').toArray()).subscribe({ next: setReminders, error: () => setError('Could not read reminders.') });
+    const subscription = db && liveQuery(() => db.reminders.orderBy('dueDate').toArray()).subscribe({ next: items => setReminders(items.filter(item => !item.deleted)), error: () => setError('Could not read reminders.') });
     return () => { window.removeEventListener('focus', update); subscription?.unsubscribe(); };
   }, [db]);
 
@@ -270,12 +275,37 @@ function Reminders({ db, user, cards, onSignIn, onDueCount }) {
     } catch (error) { setError(error.message || 'Could not update this reminder.'); }
   }
 
+  async function saveEdit(event) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    try {
+      const title = String(data.get('title')).trim();
+      if (!title) throw new Error('Enter a payment name.');
+      const cardId = String(data.get('cardId') || '');
+      if (cardId && cardId !== editing.cardId && !cards.some(card => card.id === cardId && !card.deletedAt)) throw new Error('Select a valid credit card.');
+      const amount = cardId ? toCentavos(String(data.get('amount'))) : 0;
+      const dueDate = String(data.get('dueDate'));
+      const time = String(data.get('notifyTime') || '');
+      const sendAt = time ? reminderSendAt(dueDate, time) : '';
+      if (sendAt && sendAt !== (editing.sendAt || '') && new Date(sendAt) <= new Date()) throw new Error('Choose a future notification time.');
+      await updateReminder(db, editing.id, { title, dueDate, cardId, amount, sendAt }, editing.syncVersion);
+      setEditing(null); setError('');
+    } catch (err) { setError(err.issues?.[0]?.message || err.message || 'Could not update this reminder.'); }
+  }
+
+  async function removeReminder(reminder) {
+    if (!window.confirm(`Delete ${reminder.title}?${reminder.paid && reminder.cardId ? ' Its payment will no longer replenish the card balance.' : ''}`)) return;
+    try { await updateReminder(db, reminder.id, { deleted: true }, reminder.syncVersion); setEditing(null); setError(''); }
+    catch (err) { setError(err.message || 'Could not delete this reminder.'); }
+  }
+
   const due = reminders.filter(reminder => !reminder.paid && reminder.dueDate <= date);
   useEffect(() => { onDueCount(due.length); }, [due.length, onDueCount]);
   return <section className="panel reminder-panel"><span className="eyebrow">PAYMENT CHECKLIST</span><h2>Remind me</h2><p>Reminders sync to your account. Enable notifications and choose a time for an alert on the due date (Asia/Manila). Offline changes take effect on the server after sync.</p><EnableNotificationsButton user={user} onSignIn={onSignIn} />
     {due.length > 0 && <aside className="notice reminder-alert" role="status"><strong>{due.length} payment{due.length === 1 ? '' : 's'} due or overdue.</strong> Review your checklist below.</aside>}
     <form onSubmit={add}><div className="row"><label>Payment name<input name="title" maxLength="80" required placeholder="e.g. Internet bill" /></label><label>Due date<input name="dueDate" type="date" required /></label></div><label>Notification time (Asia/Manila) <span className="optional">(optional)</span><input name="notifyTime" type="time" /></label><div className="row"><label>Credit card <span className="optional">(optional)</span><select name="cardId"><option value="">No credit card</option>{cards.filter(card => !card.deletedAt).map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label><label>Card payment amount (PHP)<input name="amount" inputMode="decimal" placeholder="0.00" /></label></div><button type={db ? 'submit' : 'button'} onClick={db ? undefined : onSignIn}>{db ? 'Add reminder' : 'Sign in to save a reminder'}</button></form>
+    {editing && <form key={editing.id} onSubmit={saveEdit}><h2>Edit reminder</h2><div className="row"><label>Payment name<input name="title" maxLength="80" required defaultValue={editing.title} /></label><label>Due date<input name="dueDate" type="date" required defaultValue={editing.dueDate} /></label></div><label>Notification time (Asia/Manila) <span className="optional">(optional)</span><input name="notifyTime" type="time" defaultValue={editing.sendAt ? new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(editing.sendAt)) : ''} /></label><div className="row"><label>Credit card <span className="optional">(optional)</span><select name="cardId" defaultValue={editing.cardId || ''}><option value="">No credit card</option>{cards.filter(card => !card.deletedAt || card.id === editing.cardId).map(card => <option key={card.id} value={card.id}>{card.name}{card.deletedAt ? ' (removed)' : ''}</option>)}</select></label><label>Card payment amount (PHP)<input name="amount" inputMode="decimal" defaultValue={editing.amount ? (editing.amount / 100).toFixed(2) : ''} placeholder="0.00" /></label></div><div className="auth-actions"><button type="submit">Save changes</button><button type="button" className="secondary" onClick={() => setEditing(null)}>Cancel</button></div></form>}
     {error && <p role="alert" className="error">{error}</p>}
-    {db && reminders.length > 0 && <ul>{reminders.map(reminder => <li key={reminder.id}><div><strong>{reminder.title}</strong><small>{reminder.dueDate} · {paymentStatus(reminder, date)}{reminder.sendAt ? ` · alert ${new Intl.DateTimeFormat('en-PH', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Manila' }).format(new Date(reminder.sendAt))}` : ''}{reminder.cardId ? ` · ${cards.find(card => card.id === reminder.cardId)?.name || 'Credit card'} · ${money(reminder.amount)}` : ''}</small></div><button className="secondary" onClick={() => markPaid(reminder)}>{reminder.paid ? 'Undo payment' : 'Mark paid'}</button></li>)}</ul>}
+    {db && reminders.length > 0 && <ul>{reminders.map(reminder => <li key={reminder.id}><div><strong>{reminder.title}</strong><small>{reminder.dueDate} · {paymentStatus(reminder, date)}{reminder.sendAt ? ` · alert ${new Intl.DateTimeFormat('en-PH', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Manila' }).format(new Date(reminder.sendAt))}` : ''}{reminder.cardId ? ` · ${cards.find(card => card.id === reminder.cardId)?.name || 'Credit card'} · ${money(reminder.amount)}` : ''}</small></div><ActionsMenu label={`Actions for ${reminder.title}`}><button type="button" onClick={() => markPaid(reminder)}>{reminder.paid ? 'Undo payment' : 'Mark paid'}</button><button type="button" onClick={() => { setEditing(reminder); setError(''); }}>Edit</button><button type="button" onClick={() => removeReminder(reminder)}>Delete</button></ActionsMenu></li>)}</ul>}
   </section>;
 }
