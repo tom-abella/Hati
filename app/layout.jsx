@@ -4,6 +4,7 @@ export const metadata = {
   title: 'Hati — personal budget',
   description: 'A personal budget, wherever you are.',
   manifest: '/manifest.json',
+  icons: { icon: [{ url: '/icon.svg', type: 'image/svg+xml' }] },
   appleWebApp: { capable: true, title: 'Hati', statusBarStyle: 'default' },
 };
 export const viewport = { themeColor: '#f8f7f2', width: 'device-width', initialScale: 1 };
