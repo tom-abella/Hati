@@ -9,7 +9,7 @@ import { availableCredit } from '@/lib/cards';
 import { supabase } from '@/lib/supabase';
 import ImageEntry from './image-entry';
 import EnableNotificationsButton from './enable-notifications-button';
-import { addTransaction, deleteTransaction, syncTransactions } from '@/lib/sync';
+import { addCard, addReminder, addTransaction, deleteTransaction, setReminderPaid, syncTransactions, updateCard } from '@/lib/sync';
 
 const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 
@@ -102,6 +102,7 @@ function Budget({ user, onSignIn }) {
   const [pending, setPending] = useState(0);
   const [lastSync, setLastSync] = useState('');
   const [syncMessage, setSyncMessage] = useState('');
+  const syncNow = useRef(null);
 
   useEffect(() => {
     setMonth(today().slice(0, 7));
@@ -120,7 +121,7 @@ function Budget({ user, onSignIn }) {
     const controller = new AbortController();
     const sync = () => {
       if (!navigator.onLine || controller.signal.aborted) return;
-      setSyncMessage('Syncing transactions…');
+      setSyncMessage('Syncing your records…');
       syncTransactions(db, user.id, controller.signal).then(async () => {
         if (!controller.signal.aborted) {
           setSyncMessage('');
@@ -130,11 +131,12 @@ function Budget({ user, onSignIn }) {
         if (!controller.signal.aborted) setSyncMessage(`Sync failed: ${error.message || 'try again when online.'}`);
       });
     };
+    syncNow.current = sync;
     const subscription = liveQuery(async () => ({ count: await db.syncQueue.count(), last: await db.syncMeta.get('lastSync') })).subscribe({ next: ({ count, last }) => { setPending(count); setLastSync(last?.value || ''); if (count) sync(); }, error: () => setSyncMessage('Could not read sync status.') });
     window.addEventListener('online', sync);
     window.addEventListener('focus', sync);
     sync();
-    return () => { controller.abort(); subscription.unsubscribe(); window.removeEventListener('online', sync); window.removeEventListener('focus', sync); };
+    return () => { syncNow.current = null; controller.abort(); subscription.unsubscribe(); window.removeEventListener('online', sync); window.removeEventListener('focus', sync); };
   }, [db, user?.id]);
 
   async function addEntry(event) {
@@ -147,7 +149,7 @@ function Budget({ user, onSignIn }) {
       const category = String(data.get('category')).trim();
       if (!category) throw new Error('Enter a category.');
       const cardId = String(data.get('card_id') || '');
-      if (cardId && (data.get('type') !== 'expense' || !cards.some(card => card.id === cardId))) throw new Error('Select a valid credit card for an expense.');
+      if (cardId && (data.get('type') !== 'expense' || !cards.some(card => card.id === cardId && !card.deletedAt))) throw new Error('Select a valid credit card for an expense.');
       await addTransaction(db, { id: crypto.randomUUID(), type: data.get('type'), amount, category, date: data.get('date'), account: String(data.get('account')).trim(), note: String(data.get('note')).trim(), card_id: cardId });
       form.reset();
       setEntryType('expense');
@@ -174,8 +176,8 @@ function Budget({ user, onSignIn }) {
   return <main>
     <header><div><span className="eyebrow">HATI / PERSONAL BUDGET</span><h1>A little more clarity.</h1><p>Your money, in one thoughtful place.</p></div><div className="account"><span className="status"><span className={online ? 'dot' : 'dot offline'} />{online ? 'Online' : 'Offline'}</span>{user ? <><span>{user.email}</span><button className="secondary" onClick={async () => { const { error } = await supabase.auth.signOut({ scope: 'local' }); if (error) setError(error.message); }}>Sign out</button></> : <button className="secondary" onClick={onSignIn}>Sign in</button>}</div></header>
     <nav className="navigation" aria-label="Budget sections">{['Overview', 'Transactions', 'Cards', 'Reminders', 'Coming up'].map(item => <button type="button" key={item} aria-current={section === item ? 'page' : undefined} onClick={() => setSection(item)}>{item}</button>)}</nav>
-    <aside className="notice"><strong>Early preview.</strong> {user ? `Transactions: ${pending} pending change${pending === 1 ? '' : 's'}. Last successful sync: ${lastSync ? new Date(lastSync).toLocaleString() : 'never'}.` : 'Browse as a guest; sign in to save or view personal entries.'} {syncMessage} Cards and checklist entries stay on this device. Scheduled notifications require setup and connectivity.</aside>
-    {dueCount > 0 && section !== 'Reminders' && <aside className="notice" role="status"><strong>{dueCount} payment{dueCount === 1 ? '' : 's'} due or overdue.</strong> <button className="secondary" onClick={() => setSection('Reminders')}>View reminders</button></aside>}
+    <aside className="notice notice-with-action"><div><strong>Early preview.</strong> {user ? `Records: ${pending} pending change${pending === 1 ? '' : 's'}. Last successful sync: ${lastSync ? new Date(lastSync).toLocaleString() : 'never'}.` : 'Browse as a guest; sign in to save or view personal entries.'} {syncMessage} Scheduled notifications require setup and connectivity; offline changes take effect on the server after sync.</div>{user && <button type="button" className="secondary" disabled={!online} onClick={() => syncNow.current?.()}>Sync now</button>}</aside>
+    {dueCount > 0 && section !== 'Reminders' && <aside className="notice notice-with-action" role="status"><strong>{dueCount} payment{dueCount === 1 ? '' : 's'} due or overdue.</strong><button className="secondary" onClick={() => setSection('Reminders')}>View reminders</button></aside>}
     <div hidden={section !== 'Overview'}>
     <section className="heading"><div><span className="eyebrow">YOUR OVERVIEW</span><h2>Monthly snapshot</h2></div><label>Month <input aria-label="Report month" type="month" value={month} onChange={e => setMonth(e.target.value)} /></label></section>
     <section className="stats"><article className="stat dark"><span>Left after expenses</span><strong>{money(income - expenses)}</strong><small>Income less spending</small></article><article className="stat"><span>Income</span><strong>{money(income)}</strong><small>This month</small></article><article className="stat"><span>Expenses</span><strong>{money(expenses)}</strong><small>This month</small></article></section>
@@ -185,7 +187,7 @@ function Budget({ user, onSignIn }) {
     <div className="columns"><section className="panel"><span className="eyebrow">KEEP TRACK</span><h2>Add a transaction</h2><p>Record income or an expense in Philippine pesos.</p><div className="entry-mode" role="group" aria-label="Transaction entry method"><button type="button" className="secondary" aria-pressed={entryMode === 'manual'} onClick={() => setEntryMode('manual')}>Manual entry</button><button type="button" className="secondary" aria-pressed={entryMode === 'image'} onClick={() => setEntryMode('image')}>Upload image</button></div><div hidden={entryMode !== 'manual'}><form onSubmit={addEntry}>
       <div className="row"><label>Type<select name="type" value={entryType} onChange={e => setEntryType(e.target.value)}><option value="expense">Expense</option><option value="income">Income</option></select></label><label>Amount (PHP)<input name="amount" type="text" inputMode="decimal" placeholder="0.00" required /></label></div>
       <div className="row"><label>Category<input name="category" placeholder="e.g. Groceries" maxLength="80" required /></label><label>Date<input name="date" type="date" defaultValue={today()} required /></label></div>
-      {entryType === 'expense' && <label>Credit card <span className="optional">(optional)</span><select name="card_id"><option value="">No credit card</option>{cards.map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label>}
+      {entryType === 'expense' && <label>Credit card <span className="optional">(optional)</span><select name="card_id"><option value="">No credit card</option>{cards.filter(card => !card.deletedAt).map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label>}
       <label>Payment account<input name="account" placeholder="e.g. Cash" maxLength="80" /></label><label>Note <span className="optional">(optional)</span><input name="note" placeholder="Add a note" maxLength="250" /></label>
       {error && <p role="alert" className="error">{error}</p>}<button type={user ? 'submit' : 'button'} onClick={user ? undefined : onSignIn}>{user ? 'Add transaction' : 'Sign in to save'} <span>→</span></button>
     </form></div><div hidden={entryMode !== 'image'}><ImageEntry db={db} cards={cards} onSignIn={onSignIn} /></div></section><section className="panel"><div className="list-heading"><div><span className="eyebrow">YOUR ACTIVITY</span><h2>Transactions</h2></div><button className="secondary" onClick={user ? exportCsv : onSignIn}>{user ? 'Export CSV' : 'Sign in'}</button></div><p>{user ? 'Showing locally available data for the selected month.' : 'Sign in to view your transactions on this device.'}</p>
@@ -196,6 +198,7 @@ function Budget({ user, onSignIn }) {
 
 function Cards({ db, cards, entries, reminders, onSignIn }) {
   const [error, setError] = useState('');
+  const [editing, setEditing] = useState(null);
   async function add(event) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -203,14 +206,30 @@ function Cards({ db, cards, entries, reminders, onSignIn }) {
     try {
       const name = String(data.get('name')).trim();
       if (!name) throw new Error('Enter a card name.');
-      await db.cards.add({ id: crypto.randomUUID(), name, limit: toCentavos(String(data.get('limit'))) });
+      await addCard(db, { id: crypto.randomUUID(), name, limit: toCentavos(String(data.get('limit'))) });
       form.reset(); setError('');
     } catch (err) { setError(err.issues?.[0]?.message || err.message || 'Could not save this card.'); }
   }
-  return <section className="panel reminder-panel"><span className="eyebrow">YOUR CREDIT</span><h2>Credit cards</h2><p>Available credit reflects recorded card expenses and paid card reminders. Cards stay on this device.</p>
+  async function saveEdit(event) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    try {
+      const name = String(data.get('name')).trim();
+      if (!name) throw new Error('Enter a card name.');
+      await updateCard(db, editing.id, { name, limit: toCentavos(String(data.get('limit'))) }, editing);
+      setEditing(null); setError('');
+    } catch (err) { setError(err.issues?.[0]?.message || err.message || 'Could not update this card.'); }
+  }
+  async function removeCard(card) {
+    if (!window.confirm(`Remove ${card.name}? Existing transactions and reminders will be kept.`)) return;
+    try { await updateCard(db, card.id, { deletedAt: new Date().toISOString() }, card); setEditing(null); setError(''); }
+    catch (err) { setError(err.message || 'Could not remove this card.'); }
+  }
+  return <section className="panel reminder-panel"><span className="eyebrow">YOUR CREDIT</span><h2>Credit cards</h2><p>Cards, recorded expenses and paid reminders sync to your account. Available credit updates after changes sync.</p>
     <form onSubmit={add}><div className="row"><label>Card name<input name="name" maxLength="80" required placeholder="e.g. Visa" /></label><label>Credit limit (PHP)<input name="limit" inputMode="decimal" required placeholder="0.00" /></label></div><button type={db ? 'submit' : 'button'} onClick={db ? undefined : onSignIn}>{db ? 'Add card' : 'Sign in to add a card'}</button></form>
     {error && <p role="alert" className="error">{error}</p>}
-    {cards.length > 0 && <ul>{cards.map(card => <li key={card.id}><div><strong>{card.name}</strong><small>Credit limit {money(card.limit)}</small></div><div className="entry-end"><strong>{money(availableCredit(card, entries, reminders))}</strong><small>Available credit</small></div></li>)}</ul>}
+    {editing && <form key={editing.id} onSubmit={saveEdit}><h2>Edit card</h2><div className="row"><label>Card name<input name="name" maxLength="80" required defaultValue={editing.name} /></label><label>Credit limit (PHP)<input name="limit" inputMode="decimal" required defaultValue={(editing.limit / 100).toFixed(2)} /></label></div><div className="auth-actions"><button type="submit">Save changes</button><button type="button" className="secondary" onClick={() => setEditing(null)}>Cancel</button></div></form>}
+    {cards.some(card => !card.deletedAt) && <ul>{cards.filter(card => !card.deletedAt).map(card => <li key={card.id}><div><strong>{card.name}</strong><small>Credit limit {money(card.limit)}</small></div><div className="card-row-end"><div className="entry-end"><strong>{money(availableCredit(card, entries, reminders))}</strong><small>Available credit</small></div><div className="card-actions"><button type="button" className="secondary" aria-label={`Edit ${card.name}`} title="Edit card" onClick={() => { setEditing(card); setError(''); }}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" /></svg></button><button type="button" className="delete" aria-label={`Remove ${card.name}`} title="Remove card" onClick={() => removeCard(card)}><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m5 4v6m4-6v6" /></svg></button></div></div></li>)}</ul>}
   </section>;
 }
 
@@ -234,37 +253,28 @@ function Reminders({ db, user, cards, onSignIn, onDueCount }) {
     if (!title) { setError('Enter a payment name.'); return; }
     try {
       const cardId = String(data.get('cardId') || '');
-      if (cardId && !cards.some(card => card.id === cardId)) throw new Error('Select a valid credit card.');
+      if (cardId && !cards.some(card => card.id === cardId && !card.deletedAt)) throw new Error('Select a valid credit card.');
       const amount = cardId ? toCentavos(String(data.get('amount'))) : 0;
       const id = crypto.randomUUID();
       const time = String(data.get('notifyTime') || '');
       const sendAt = time ? reminderSendAt(String(data.get('dueDate')), time) : '';
       if (sendAt && new Date(sendAt) <= new Date()) throw new Error('Choose a future notification time.');
-      if (sendAt) {
-        const { error } = await supabase.from('reminders').insert({ id, user_id: user.id, title: 'Payment reminder', body: `${title} is due today.`, url: '/?section=reminders', send_at: sendAt });
-        if (error) throw new Error('Could not schedule the notification. Check your connection and try again.');
-      }
-      try { await db.reminders.add({ id, title, dueDate: data.get('dueDate'), paid: false, cardId, amount, sendAt }); }
-      catch (error) { if (sendAt) await supabase.from('reminders').delete().eq('id', id); throw error; }
+      await addReminder(db, { id, title, dueDate: data.get('dueDate'), paid: false, cardId, amount, sendAt });
       form.reset(); setError('');
     } catch (err) { setError(err.issues?.[0]?.message || err.message || 'Could not save this reminder on this device.'); }
   }
 
   async function markPaid(reminder) {
     try {
-      if (reminder.sendAt && (!reminder.paid || new Date(reminder.sendAt) > new Date())) {
-        const { data, error } = await supabase.from('reminders').update({ sent_at: reminder.paid ? null : new Date().toISOString() }).eq('id', reminder.id).select('id').maybeSingle();
-        if (error || !data) throw new Error('Connect to update this scheduled reminder.');
-      }
-      await db.reminders.update(reminder.id, { paid: !reminder.paid }); setError('');
+      await setReminderPaid(db, reminder.id, !reminder.paid); setError('');
     } catch (error) { setError(error.message || 'Could not update this reminder.'); }
   }
 
   const due = reminders.filter(reminder => !reminder.paid && reminder.dueDate <= date);
   useEffect(() => { onDueCount(due.length); }, [due.length, onDueCount]);
-  return <section className="panel reminder-panel"><span className="eyebrow">PAYMENT CHECKLIST</span><h2>Remind me</h2><p>Checklist entries stay on this device. Enable notifications and choose a time to schedule an alert for the due date (Asia/Manila). Scheduling and updating scheduled payments requires a connection.</p><EnableNotificationsButton user={user} onSignIn={onSignIn} />
+  return <section className="panel reminder-panel"><span className="eyebrow">PAYMENT CHECKLIST</span><h2>Remind me</h2><p>Reminders sync to your account. Enable notifications and choose a time for an alert on the due date (Asia/Manila). Offline changes take effect on the server after sync.</p><EnableNotificationsButton user={user} onSignIn={onSignIn} />
     {due.length > 0 && <aside className="notice reminder-alert" role="status"><strong>{due.length} payment{due.length === 1 ? '' : 's'} due or overdue.</strong> Review your checklist below.</aside>}
-    <form onSubmit={add}><div className="row"><label>Payment name<input name="title" maxLength="80" required placeholder="e.g. Internet bill" /></label><label>Due date<input name="dueDate" type="date" required /></label></div><label>Notification time (Asia/Manila) <span className="optional">(optional)</span><input name="notifyTime" type="time" /></label><div className="row"><label>Credit card <span className="optional">(optional)</span><select name="cardId"><option value="">No credit card</option>{cards.map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label><label>Card payment amount (PHP)<input name="amount" inputMode="decimal" placeholder="0.00" /></label></div><button type={db ? 'submit' : 'button'} onClick={db ? undefined : onSignIn}>{db ? 'Add reminder' : 'Sign in to save a reminder'}</button></form>
+    <form onSubmit={add}><div className="row"><label>Payment name<input name="title" maxLength="80" required placeholder="e.g. Internet bill" /></label><label>Due date<input name="dueDate" type="date" required /></label></div><label>Notification time (Asia/Manila) <span className="optional">(optional)</span><input name="notifyTime" type="time" /></label><div className="row"><label>Credit card <span className="optional">(optional)</span><select name="cardId"><option value="">No credit card</option>{cards.filter(card => !card.deletedAt).map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label><label>Card payment amount (PHP)<input name="amount" inputMode="decimal" placeholder="0.00" /></label></div><button type={db ? 'submit' : 'button'} onClick={db ? undefined : onSignIn}>{db ? 'Add reminder' : 'Sign in to save a reminder'}</button></form>
     {error && <p role="alert" className="error">{error}</p>}
     {db && reminders.length > 0 && <ul>{reminders.map(reminder => <li key={reminder.id}><div><strong>{reminder.title}</strong><small>{reminder.dueDate} · {paymentStatus(reminder, date)}{reminder.sendAt ? ` · alert ${new Intl.DateTimeFormat('en-PH', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Manila' }).format(new Date(reminder.sendAt))}` : ''}{reminder.cardId ? ` · ${cards.find(card => card.id === reminder.cardId)?.name || 'Credit card'} · ${money(reminder.amount)}` : ''}</small></div><button className="secondary" onClick={() => markPaid(reminder)}>{reminder.paid ? 'Undo payment' : 'Mark paid'}</button></li>)}</ul>}
   </section>;

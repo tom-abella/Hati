@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { liveQuery } from 'dexie';
 import { possibleDuplicate, validateDocument } from '@/lib/documents';
-import { transactionPayload } from '@/lib/sync';
+import { documentPayload, transactionPayload } from '@/lib/sync';
 import { receiptSuggestions } from '@/lib/receipt-text';
 
 export default function ImageEntry({ db, cards, onSignIn }) {
@@ -63,12 +63,14 @@ export default function ImageEntry({ db, cards, onSignIn }) {
       const data = new FormData(form);
       const item = validateDocument(Object.fromEntries(data));
       const cardId = String(data.get('card_id') || '');
-      if (cardId && (item.type !== 'expense' || !cards.some(card => card.id === cardId))) throw new Error('Select a credit card only for an expense.');
+      if (cardId && (item.type !== 'expense' || !cards.some(card => card.id === cardId && !card.deletedAt))) throw new Error('Select a credit card only for an expense.');
       const records = item.type === 'expense' ? await db.transactions.toArray() : await db.documents.toArray();
       if (possibleDuplicate(item, records) && !window.confirm('A record with the same type, date and amount exists. Save this possible duplicate?')) return;
       await db.transaction('rw', db.imageDrafts, db.documents, db.transactions, db.syncQueue, async () => {
         if (!temporaryDraft && !await db.imageDrafts.get(draft.id)) throw new Error('This draft no longer exists.');
-        await db.documents.add({ ...item, id: draft.id, name: draft.name });
+        const document = { ...item, id: draft.id, name: draft.name };
+        await db.documents.add(document);
+        await db.syncQueue.add({ recordId: document.id, kind: 'document-create', record: documentPayload(document) });
         if (item.type === 'expense') {
           const record = { id: draft.id, type: 'expense', amount: item.amount, date: item.date, category: 'Uncategorized', account: '', note: item.merchant, card_id: cardId };
           await db.transactions.add(record);
@@ -76,7 +78,7 @@ export default function ImageEntry({ db, cards, onSignIn }) {
         }
         await db.imageDrafts.delete(draft.id);
       });
-      setSelected(''); setTemporaryDraft(null); setSuggestions({}); setMessage('Details saved. The image was not saved. Expenses are queued for sync; bills and statements are local only.');
+      setSelected(''); setTemporaryDraft(null); setSuggestions({}); setMessage('Details saved and queued for sync. The image was not saved.');
     } catch (error) { setMessage(error.issues?.[0]?.message || error.message || 'Could not save the record.'); }
   }
 
@@ -94,7 +96,7 @@ export default function ImageEntry({ db, cards, onSignIn }) {
       {draft && <div key={draft.id}>{imageUrl && <img className="receipt-preview" src={imageUrl} alt="Selected receipt or bill" />}<p>Review required: all fields are unverified. Bill and statement records are references only; they do not create a payable or reminder.</p>
         {!busy && <form key={`${draft.id}-${suggestions.merchant || ''}-${suggestions.amount || ''}`} onSubmit={save}>
           <label>Record type<select name="type" defaultValue="expense"><option value="expense">Expense</option><option value="bill">Bill</option><option value="statement">Credit Card Statement</option></select></label>
-          <label>Credit card for expense <span className="optional">(optional)</span><select name="card_id"><option value="">No credit card</option>{cards.map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label>
+          <label>Credit card for expense <span className="optional">(optional)</span><select name="card_id"><option value="">No credit card</option>{cards.filter(card => !card.deletedAt).map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label>
           <label>Merchant or provider — required<input name="merchant" maxLength="80" defaultValue={suggestions.merchant || ''} required /></label>
           <div className="row"><label>Transaction date — required<input type="date" name="date" defaultValue={suggestions.date || ''} required /></label><label>Due date — required for bills and statements<input type="date" name="dueDate" /></label></div>
           <div className="row"><label>Total — required<input name="amount" inputMode="decimal" defaultValue={suggestions.amount || ''} required placeholder="0.00" /></label><label>Currency — required<select name="currency" defaultValue=""><option value="" disabled>Choose currency</option><option value="PHP">PHP</option></select></label></div>
