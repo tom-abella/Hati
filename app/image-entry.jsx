@@ -5,8 +5,14 @@ import { liveQuery } from 'dexie';
 import { possibleDuplicate, validateDocument } from '@/lib/documents';
 import { documentPayload, transactionPayload } from '@/lib/sync';
 import { receiptSuggestions } from '@/lib/receipt-text';
+import ApplePayEntry from './apple-pay-entry';
 
 export default function ImageEntry({ db, cards, onSignIn }) {
+  const [mode, setMode] = useState('single');
+  return <><div className="entry-mode" role="group" aria-label="Image transaction type"><button type="button" className="secondary" aria-pressed={mode === 'single'} onClick={() => setMode('single')}>Single transaction</button><button type="button" className="secondary" aria-pressed={mode === 'history'} onClick={() => setMode('history')}>Apple Pay history</button></div>{mode === 'single' ? <SingleImageEntry db={db} cards={cards} onSignIn={onSignIn} /> : <ApplePayEntry db={db} cards={cards} onSignIn={onSignIn} />}</>;
+}
+
+function SingleImageEntry({ db, cards, onSignIn }) {
   const [drafts, setDrafts] = useState([]);
   const [documents, setDocuments] = useState([]);
   const [selected, setSelected] = useState('');
