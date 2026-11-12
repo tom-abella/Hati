@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import Dexie from 'dexie';
 import { accountDb } from '../lib/db.js';
-import { addCard, addReminder, addTransaction, deleteTransaction, documentPayload, setReminderPaid, syncTransactions, updateCard, updateReminder } from '../lib/sync.js';
+import { addCard, addReminder, addSupplementaryTransaction, addTransaction, deleteTransaction, documentPayload, setReminderPaid, syncTransactions, updateCard, updateReminder } from '../lib/sync.js';
 
 const entry = { id: 'a', type: 'expense', amount: 123, category: 'Food', date: '2026-11-10', account: '', note: '' };
 
@@ -159,6 +159,50 @@ test('payment and undo queue ordered versions and repeated actions are idempoten
     assert.equal(ops[2].previousVersion, ops[1].record.syncVersion);
     assert.equal((await db.reminders.get('r')).paid, false);
   } finally { await db.delete(); }
+});
+
+test('supplementary purchases and statement selections retain IDs through the sync queue', async () => {
+  const db = accountDb(crypto.randomUUID());
+  const calls = [];
+  const client = {
+    auth: { getSession: async () => ({ data: { session: { user: { id: 'user' } } } }) },
+    rpc(name, args) { calls.push({ name, args }); return { abortSignal: async () => ({ error: null }) }; },
+    from() { return { select() { return this; }, eq() { return this; }, order() { return this; }, limit() { return this; }, abortSignal: async () => ({ data: [], error: null }) }; },
+  };
+  try {
+    await addSupplementaryTransaction(db, { id: 'shared', card_id: 'share', amount: 100, category: 'Food', date: '2026-11-01', note: '', account: 'Wallet' });
+    await addReminder(db, { id: 'bill', title: 'Bill', dueDate: '2026-11-20', paid: false, cardId: 'main', amount: 200, statementDate: '2026-11-10' });
+    await setReminderPaid(db, 'bill', true, [{ transactionId: 'shared', card: 'supplementary', amount: 100 }, { transactionId: 'own', card: 'primary', amount: 100 }]);
+    await syncTransactions(db, 'user', new AbortController().signal, client);
+    assert.equal(calls[0].args.p_id, 'shared');
+    assert.equal(calls[0].args.p_account, 'Wallet');
+    assert.deepEqual(calls[2].args.p_supplementary_ids, ['shared']);
+    assert.deepEqual(calls[2].args.p_primary_ids, ['own']);
+    assert.equal(calls[2].args.p_statement_closing_date, '2026-11-10');
+    assert.equal(await db.syncQueue.count(), 0);
+  } finally { await db.delete(); }
+});
+
+test('failed supplementary upload keeps the pending transaction for retry', async () => {
+  const db = accountDb(crypto.randomUUID());
+  const client = {
+    auth: { getSession: async () => ({ data: { session: { user: { id: 'user' } } } }) },
+    rpc() { return { abortSignal: async () => ({ error: new Error('Connection failed') }) }; },
+  };
+  try {
+    await addSupplementaryTransaction(db, { id: 'shared', card_id: 'share', amount: 100, category: 'Food', date: '2026-11-01', note: '' });
+    await assert.rejects(syncTransactions(db, 'user', new AbortController().signal, client), /Connection failed/);
+    assert.equal((await db.syncQueue.orderBy('seq').first()).record.id, 'shared');
+  } finally { await db.delete(); }
+});
+
+test('cached shared activity remains isolated by account', async () => {
+  const first = accountDb(crypto.randomUUID());
+  const second = accountDb(crypto.randomUUID());
+  try {
+    await first.sharedCache.put({ key: 'records', data: { cards: [{ id: 'private-share' }] } });
+    assert.equal(await second.sharedCache.get('records'), undefined);
+  } finally { await first.delete(); await second.delete(); }
 });
 
 test('reminders and document details sync across devices and retain conflicting local changes', async () => {
