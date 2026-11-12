@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applePaySuggestions, duplicateCount, resolveHistoryDate } from '../lib/apple-pay.js';
+import { applePaySuggestions, applyPhilippinesCurrency, duplicateCount, resolveHistoryDate } from '../lib/apple-pay.js';
 import { accountDb } from '../lib/db.js';
 import { addTransactions } from '../lib/sync.js';
 
@@ -15,6 +15,18 @@ test('history suggestions separate amounts, require dates and flag unconfirmed c
   assert.equal(applePaySuggestions('Today\n10:30 AM').length, 0);
   assert.equal(applePaySuggestions('Cafe ₱5.00\nNov 10, 2026')[0].date, '2026-11-10');
   assert.equal(applePaySuggestions('Cafe ₱5.00\n2026-02-30')[0].date, '');
+});
+
+test('Philippines selection suggests PHP only for rows without foreign currency or manual edits', () => {
+  const rows = applePaySuggestions('Cafe 10.00\nShop ₱20.00\nOnline $30.00\nTravel 40.00 SGD');
+  const enabled = applyPhilippinesCurrency(rows, true);
+  assert.deepEqual(enabled.map(row => row.currency), ['PHP', 'PHP', '', '']);
+  assert.equal(enabled[0].currencyAssumed, true);
+  assert.equal(enabled[2].foreignCurrency, true);
+  assert.equal(enabled[3].foreignCurrency, true);
+  const edited = enabled.map((row, index) => index === 0 ? { ...row, currency: 'PHP', currencyEdited: true, currencyAssumed: false } : row);
+  assert.deepEqual(applyPhilippinesCurrency(edited, false).map(row => row.currency), ['PHP', 'PHP', '', '']);
+  assert.deepEqual(applyPhilippinesCurrency(enabled, false).map(row => row.currency), ['', 'PHP', '', '']);
 });
 
 test('relative dates use the screenshot capture time and most recent earlier weekday', () => {

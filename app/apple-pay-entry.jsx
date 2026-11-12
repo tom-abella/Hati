@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { liveQuery } from 'dexie';
-import { applePaySuggestions, duplicateCount, resolveHistoryDate } from '@/lib/apple-pay';
+import { applePaySuggestions, applyPhilippinesCurrency, duplicateCount, resolveHistoryDate } from '@/lib/apple-pay';
 import { possibleDuplicate, validateDocument } from '@/lib/documents';
 import { toCentavos } from '@/lib/money';
 import { addTransactions } from '@/lib/sync';
@@ -21,6 +21,7 @@ export default function ApplePayEntry({ db, cards, onSignIn }) {
   const [cardId, setCardId] = useState('');
   const [capturedAt, setCapturedAt] = useState('');
   const [dateOrder, setDateOrder] = useState('');
+  const [takenInPhilippines, setTakenInPhilippines] = useState(false);
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const controller = useRef(null);
@@ -43,6 +44,7 @@ export default function ApplePayEntry({ db, cards, onSignIn }) {
     const signal = controller.current.signal;
     const reference = manilaNow();
     setCapturedAt(reference);
+    setTakenInPhilippines(false);
     setImageUrl(URL.createObjectURL(file)); setRows([]); setText(''); setBusy(true); setMessage('Reading the screenshot on this device…');
     let worker;
     try {
@@ -61,7 +63,7 @@ export default function ApplePayEntry({ db, cards, onSignIn }) {
   }
 
   function change(id, key, value) {
-    setRows(items => items.map(row => row.id === id ? { ...row, [key]: value, ...(key === 'date' ? { dateEdited: true } : {}) } : row));
+    setRows(items => items.map(row => row.id === id ? { ...row, [key]: value, ...(key === 'date' ? { dateEdited: true } : {}), ...(key === 'currency' ? { currencyEdited: true, currencyAssumed: false } : {}) } : row));
   }
 
   function updateDates() {
@@ -110,13 +112,13 @@ export default function ApplePayEntry({ db, cards, onSignIn }) {
       {imageUrl && <>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img className="receipt-preview" src={imageUrl} alt="Selected Apple Pay history screenshot" />{text && <details><summary>Show extracted text</summary><pre className="history-text">{text}</pre></details>}
-        {!busy && <form onSubmit={save}><label>Screenshot taken at (Asia/Manila)<input type="datetime-local" value={capturedAt} onChange={event => setCapturedAt(event.target.value)} /></label><p>Defaults to when you uploaded the screenshot. Change it if the screenshot was taken earlier; relative dates depend on it. A weekday matching the capture day is left blank for review.</p><label>For dates like 11/4/26<select value={dateOrder} onChange={event => setDateOrder(event.target.value)}><option value="">Choose date order if ambiguous</option><option value="MDY">Month/day/year</option><option value="DMY">Day/month/year</option></select></label><button type="button" className="secondary" onClick={updateDates}>Update suggested dates</button><p>This updates detected dates you haven’t edited. Check every date against the screenshot.</p><label>Credit card for selected expenses <span className="optional">(optional)</span><select value={cardId} onChange={event => setCardId(event.target.value)}><option value="">No credit card</option>{cards.filter(card => !card.deletedAt).map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label>
-          {rows.map((row, index) => <fieldset className="history-row" key={row.id}><legend>Entry {index + 1}</legend><label className="history-select"><input type="checkbox" checked={row.selected} onChange={event => change(row.id, 'selected', event.target.checked)} /> Import this entry</label>{row.source && <p>Detected: {row.source}</p>}{row.dateLabel && <p>Detected date: {row.dateLabel} — verify the suggested date.</p>}{duplicate(row) && <p className="error">Possible duplicate: an existing expense has the same date and amount.</p>}
+        {!busy && <form onSubmit={save}><label>Screenshot taken at (Asia/Manila)<input type="datetime-local" value={capturedAt} onChange={event => setCapturedAt(event.target.value)} /></label><p>Defaults to when you uploaded the screenshot. Change it if the screenshot was taken earlier; relative dates depend on it. A weekday matching the capture day is left blank for review.</p><label>For dates like 11/4/26<select value={dateOrder} onChange={event => setDateOrder(event.target.value)}><option value="">Choose date order if ambiguous</option><option value="MDY">Month/day/year</option><option value="DMY">Day/month/year</option></select></label><button type="button" className="secondary" onClick={updateDates}>Update suggested dates</button><p>This updates detected dates you haven’t edited. Check every date against the screenshot.</p><label className="history-select"><input type="checkbox" checked={takenInPhilippines} onChange={event => { const checked = event.target.checked; setTakenInPhilippines(checked); setRows(items => applyPhilippinesCurrency(items, checked)); }} /> Screenshot taken in the Philippines: suggest PHP when no currency is visible</label><p>Location doesn’t guarantee the transaction currency. Check each amount; detected foreign currencies are not automatically changed.</p><label>Credit card for selected expenses <span className="optional">(optional)</span><select value={cardId} onChange={event => setCardId(event.target.value)}><option value="">No credit card</option>{cards.filter(card => !card.deletedAt).map(card => <option key={card.id} value={card.id}>{card.name}</option>)}</select></label>
+          {rows.map((row, index) => <fieldset className="history-row" key={row.id}><legend>Entry {index + 1}</legend><label className="history-select"><input type="checkbox" checked={row.selected} onChange={event => change(row.id, 'selected', event.target.checked)} /> Import this entry</label>{row.source && <p>Detected: {row.source}</p>}{row.dateLabel && <p>Detected date: {row.dateLabel} — verify the suggested date.</p>}{row.currencyAssumed && <p>PHP suggested from the screenshot location; verify the currency.</p>}{row.foreignCurrency && <p className="error">A foreign currency was detected. Confirm the amount and currency before importing.</p>}{duplicate(row) && <p className="error">Possible duplicate: an existing expense has the same date and amount.</p>}
             <div className="row"><label>Merchant<input value={row.merchant} maxLength="80" onChange={event => change(row.id, 'merchant', event.target.value)} /></label><label>Amount<input value={row.amount} inputMode="decimal" onChange={event => change(row.id, 'amount', event.target.value)} placeholder="0.00" /></label></div>
             <div className="row"><label>Date<input type="date" value={row.date} onChange={event => change(row.id, 'date', event.target.value)} /></label><label>Currency<select value={row.currency} onChange={event => change(row.id, 'currency', event.target.value)}><option value="">Confirm currency</option><option value="PHP">PHP</option></select></label></div>
             <label>Category<input value={row.category} maxLength="80" onChange={event => change(row.id, 'category', event.target.value)} /></label>
           </fieldset>)}
-          <div className="auth-actions"><button type="button" className="secondary" onClick={() => setRows(items => [...items, blankRow()])}>Add missing entry</button><button type="submit">Import selected</button></div>
+          <div className="auth-actions"><button type="button" className="secondary" onClick={() => setRows(items => [...items, ...applyPhilippinesCurrency([blankRow()], takenInPhilippines)])}>Add missing entry</button><button type="submit">Import selected</button></div>
         </form>}
       </>}
     </>}{message && <p role="status" className="image-message">{message}</p>}
